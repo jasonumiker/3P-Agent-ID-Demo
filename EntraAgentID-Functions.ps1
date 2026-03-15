@@ -112,6 +112,7 @@ function Connect-EntraAgentIDEnvironment {
         "AgentIdentityBlueprint.DeleteRestore.All",
         "AgentIdentity.DeleteRestore.All",
         "DelegatedPermissionGrant.ReadWrite.All",
+        "Application.ReadWrite.All",
         "Application.Read.All",
         "AgentIdentityBlueprintPrincipal.Create",
         "AppRoleAssignment.ReadWrite.All",
@@ -530,13 +531,39 @@ function Get-AgentIdentityToken {
         fmi_path      = $AgentIdentityAppId
     }
     
-    $t1Response = Invoke-RestMethod -Method POST `
-        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-        -ContentType "application/x-www-form-urlencoded" `
-        -Body $t1Body
+    $maxRetries = 10
+    $retryCount = 0
+    $blueprintToken = $null
     
-    $blueprintToken = $t1Response.access_token
-    Write-Host "  [OK] Got T1 token (Blueprint impersonation)" -ForegroundColor Green
+    while (-not $blueprintToken -and $retryCount -lt $maxRetries) {
+        try {
+            $t1Response = Invoke-RestMethod -Method POST `
+                -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+                -ContentType "application/x-www-form-urlencoded" `
+                -Body $t1Body `
+                -ErrorAction Stop
+            
+            $blueprintToken = $t1Response.access_token
+            Write-Host "  [OK] Got T1 token (Blueprint impersonation)" -ForegroundColor Green
+        }
+        catch {
+            $retryCount++
+            $errorDetail = $_.ErrorDetails.Message
+            
+            if ($retryCount -lt $maxRetries) {
+                Write-Host "  [WAIT] T1 token request failed, retrying... (attempt $retryCount/$maxRetries)" -ForegroundColor Yellow
+                Write-Host "         Error: $errorDetail" -ForegroundColor Gray
+                Start-Sleep -Seconds 5
+            }
+            else {
+                Write-Error "  [ERROR] Failed to get T1 token after $maxRetries attempts"
+                Write-Error "  Error: $errorDetail"
+                Write-Host "  This is usually AADSTS7000215 (invalid client secret)." -ForegroundColor Yellow
+                Write-Host "  The secret may need more time to propagate, or the agent identity may not be ready." -ForegroundColor Yellow
+                throw
+            }
+        }
+    }
     
     if ($ShowClaims) {
         Write-Host "  T1 Claims:" -ForegroundColor Gray
@@ -553,13 +580,37 @@ function Get-AgentIdentityToken {
         client_assertion      = $blueprintToken
     }
     
-    $t2Response = Invoke-RestMethod -Method POST `
-        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-        -ContentType "application/x-www-form-urlencoded" `
-        -Body $t2Body
+    $maxRetries = 5
+    $retryCount = 0
+    $agentToken = $null
     
-    $agentToken = $t2Response.access_token
-    Write-Host "  [OK] Got T2 token (Agent identity)" -ForegroundColor Green
+    while (-not $agentToken -and $retryCount -lt $maxRetries) {
+        try {
+            $t2Response = Invoke-RestMethod -Method POST `
+                -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+                -ContentType "application/x-www-form-urlencoded" `
+                -Body $t2Body `
+                -ErrorAction Stop
+            
+            $agentToken = $t2Response.access_token
+            Write-Host "  [OK] Got T2 token (Agent identity)" -ForegroundColor Green
+        }
+        catch {
+            $retryCount++
+            $errorDetail = $_.ErrorDetails.Message
+            
+            if ($retryCount -lt $maxRetries) {
+                Write-Host "  [WAIT] T2 token exchange failed, retrying... (attempt $retryCount/$maxRetries)" -ForegroundColor Yellow
+                Write-Host "         Error: $errorDetail" -ForegroundColor Gray
+                Start-Sleep -Seconds 5
+            }
+            else {
+                Write-Error "  [ERROR] Failed to get T2 token after $maxRetries attempts"
+                Write-Error "  Error: $errorDetail"
+                throw
+            }
+        }
+    }
     
     if ($ShowClaims) {
         Write-Host "  T2 Claims:" -ForegroundColor Gray
@@ -894,6 +945,376 @@ function Get-AgentUsersList {
 
 #endregion
 
+#region Step 5c: Create SPA App Registration for OBO Flow
+
+function New-AgentIdentitySpaApp {
+    <#
+    .SYNOPSIS
+    Creates a SPA (Single Page Application) app registration in Entra ID for the OBO login flow,
+    and configures the Blueprint to expose the required 'access_as_user' scope.
+
+    .DESCRIPTION
+    The On-Behalf-Of (OBO) flow requires:
+      1. The Blueprint app exposes an API scope: api://{BlueprintAppId}/access_as_user
+      2. A SPA app registration that users sign into via MSAL.js
+      3. The SPA app has delegated permission to api://{BlueprintAppId}/access_as_user
+      4. Admin consent is granted for that permission
+
+    This function performs ALL of those steps.
+
+    .PARAMETER DisplayName
+    Display name for the SPA app registration.
+
+    .PARAMETER BlueprintAppId
+    The App ID (client ID) of the Blueprint application.
+
+    .PARAMETER TenantId
+    The Entra tenant ID.
+
+    .PARAMETER RedirectUris
+    Array of redirect URIs for the SPA. Defaults to http://localhost:3001 (local dev).
+
+    .EXAMPLE
+    New-AgentIdentitySpaApp -DisplayName "Weather Agent SPA" -BlueprintAppId "aaaa-bbbb" -TenantId "cccc-dddd"
+
+    .EXAMPLE
+    New-AgentIdentitySpaApp -DisplayName "Weather Agent SPA" -BlueprintAppId "aaaa-bbbb" -TenantId "cccc-dddd" -RedirectUris @("http://localhost:3001", "https://myapp.azurecontainerapps.io")
+    #>
+    param(
+        [Parameter(Mandatory = $true, HelpMessage = "Display name for the SPA app registration")]
+        [ValidateNotNullOrEmpty()]
+        [string]$DisplayName,
+
+        [Parameter(Mandatory = $true, HelpMessage = "The App ID (client ID) of the Blueprint application")]
+        [ValidateNotNullOrEmpty()]
+        [string]$BlueprintAppId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TenantId,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$RedirectUris = @("http://localhost:3001")
+    )
+
+    Write-Host "[SPA] Step 5c: Creating SPA App Registration for OBO Flow..." -ForegroundColor Cyan
+    Write-Host ""
+
+    # Verify Microsoft Graph connection
+    $currentContext = Get-MgContext -ErrorAction SilentlyContinue
+    if (-not $currentContext) {
+        throw "Not connected to Microsoft Graph. Please connect first."
+    }
+
+    # ---------------------------------------------------------------
+    # Part 1: Expose API scope on the Blueprint app
+    # ---------------------------------------------------------------
+    Write-Host "  [1/4] Configuring Blueprint to expose 'access_as_user' scope..." -ForegroundColor Cyan
+
+    # Look up the Blueprint application object by appId
+    $bpApps = (Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$BlueprintAppId'").value
+
+    if (-not $bpApps -or $bpApps.Count -eq 0) {
+        throw "Blueprint application not found with appId: $BlueprintAppId"
+    }
+    $bpApp = $bpApps[0]
+    $bpObjectId = $bpApp.id
+    Write-Host "  Blueprint object ID: $bpObjectId" -ForegroundColor Gray
+
+    # Set the identifier URI if not already set
+    $identifierUri = "api://$BlueprintAppId"
+    $existingUris = $bpApp.identifierUris
+    if ($existingUris -notcontains $identifierUri) {
+        Write-Host "  Setting identifier URI: $identifierUri" -ForegroundColor Gray
+        $uriBody = @{ identifierUris = @($identifierUri) }
+        Invoke-MgGraphRequest -Method PATCH `
+            -Uri "https://graph.microsoft.com/v1.0/applications/$bpObjectId" `
+            -Body ($uriBody | ConvertTo-Json) | Out-Null
+        Write-Host "  [OK] Identifier URI set" -ForegroundColor Green
+    } else {
+        Write-Host "  [OK] Identifier URI already configured" -ForegroundColor Green
+    }
+
+    # Add oauth2PermissionScope 'access_as_user' if not already present
+    $existingScopes = $bpApp.api.oauth2PermissionScopes
+    $scopeExists = $existingScopes | Where-Object { $_.value -eq "access_as_user" }
+
+    $scopeId = $null
+    if (-not $scopeExists) {
+        $scopeId = [guid]::NewGuid().ToString()
+        $newScope = @{
+            adminConsentDescription = "Allow the agent to act on behalf of the signed-in user"
+            adminConsentDisplayName = "Access as user"
+            id                      = $scopeId
+            isEnabled               = $true
+            type                    = "User"
+            userConsentDescription  = "Allow the agent to act on your behalf"
+            userConsentDisplayName  = "Access as user"
+            value                   = "access_as_user"
+        }
+
+        # Merge with existing scopes
+        $allScopes = @()
+        if ($existingScopes) {
+            $allScopes += $existingScopes
+        }
+        $allScopes += $newScope
+
+        $apiBody = @{
+            api = @{
+                oauth2PermissionScopes = $allScopes
+            }
+        }
+        Invoke-MgGraphRequest -Method PATCH `
+            -Uri "https://graph.microsoft.com/v1.0/applications/$bpObjectId" `
+            -Body ($apiBody | ConvertTo-Json -Depth 5) | Out-Null
+        Write-Host "  [OK] 'access_as_user' scope created (id: $scopeId)" -ForegroundColor Green
+    } else {
+        $scopeId = $scopeExists.id
+        Write-Host "  [OK] 'access_as_user' scope already exists (id: $scopeId)" -ForegroundColor Green
+    }
+
+    # ---------------------------------------------------------------
+    # Part 2: Create the SPA app registration
+    # ---------------------------------------------------------------
+    Write-Host ""
+    Write-Host "  [2/4] Creating SPA app registration..." -ForegroundColor Cyan
+
+    $spaBody = @{
+        displayName            = $DisplayName
+        signInAudience         = "AzureADMyOrg"
+        spa                    = @{
+            redirectUris = $RedirectUris
+        }
+        requiredResourceAccess = @(
+            @{
+                resourceAppId  = $BlueprintAppId
+                resourceAccess = @(
+                    @{
+                        id   = $scopeId
+                        type = "Scope"   # Delegated permission
+                    }
+                )
+            }
+        )
+    }
+
+    $spaApp = Invoke-MgGraphRequest -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/applications" `
+        -Body ($spaBody | ConvertTo-Json -Depth 5)
+
+    $spaAppId = $spaApp.appId
+    $spaObjectId = $spaApp.id
+    Write-Host "  [OK] SPA app created" -ForegroundColor Green
+    Write-Host "  SPA App ID (client ID): $spaAppId" -ForegroundColor White
+    Write-Host "  SPA Object ID:          $spaObjectId" -ForegroundColor Gray
+    Write-Host "  Redirect URIs:          $($RedirectUris -join ', ')" -ForegroundColor Gray
+
+    # Create service principal for the SPA app
+    try {
+        $spBody = @{ appId = $spaAppId }
+        $spaSP = Invoke-MgGraphRequest -Method POST `
+            -Uri "https://graph.microsoft.com/v1.0/servicePrincipals" `
+            -Body ($spBody | ConvertTo-Json)
+        Write-Host "  [OK] SPA service principal created: $($spaSP.id)" -ForegroundColor Green
+    }
+    catch {
+        if ($_.Exception.Message -like "*already exists*") {
+            Write-Host "  [OK] SPA service principal already exists" -ForegroundColor Green
+            $spaSP = (Invoke-MgGraphRequest -Method GET `
+                -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$spaAppId'").value[0]
+        } else {
+            throw $_
+        }
+    }
+
+    # ---------------------------------------------------------------
+    # Part 3: Add the SPA as an authorized client on the Blueprint
+    # ---------------------------------------------------------------
+    Write-Host ""
+    Write-Host "  [3/4] Authorizing SPA as pre-authorized client on Blueprint..." -ForegroundColor Cyan
+
+    # Re-read the Blueprint to get current preAuthorizedApplications
+    $bpAppRefreshed = (Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$BlueprintAppId'").value[0]
+
+    $existingPreAuth = $bpAppRefreshed.api.preAuthorizedApplications
+    $alreadyAuthorized = $existingPreAuth | Where-Object { $_.appId -eq $spaAppId }
+
+    if (-not $alreadyAuthorized) {
+        $preAuthEntry = @{
+            appId                  = $spaAppId
+            delegatedPermissionIds = @($scopeId)
+        }
+
+        $allPreAuth = @()
+        if ($existingPreAuth) {
+            $allPreAuth += $existingPreAuth
+        }
+        $allPreAuth += $preAuthEntry
+
+        $preAuthBody = @{
+            api = @{
+                preAuthorizedApplications = $allPreAuth
+            }
+        }
+        Invoke-MgGraphRequest -Method PATCH `
+            -Uri "https://graph.microsoft.com/v1.0/applications/$bpObjectId" `
+            -Body ($preAuthBody | ConvertTo-Json -Depth 5) | Out-Null
+        Write-Host "  [OK] SPA pre-authorized on Blueprint" -ForegroundColor Green
+    } else {
+        Write-Host "  [OK] SPA already pre-authorized on Blueprint" -ForegroundColor Green
+    }
+
+    # ---------------------------------------------------------------
+    # Part 4: Grant admin consent for the delegated permission
+    # ---------------------------------------------------------------
+    Write-Host ""
+    Write-Host "  [4/4] Granting admin consent for delegated permission..." -ForegroundColor Cyan
+
+    # Get the Blueprint service principal
+    $bpSPs = (Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$BlueprintAppId'").value
+    if (-not $bpSPs -or $bpSPs.Count -eq 0) {
+        Write-Warning "  Blueprint service principal not found — admin consent skipped. You may need to consent manually."
+    } else {
+        $bpSPId = $bpSPs[0].id
+
+        try {
+            $consentBody = @{
+                clientId    = $spaSP.id
+                consentType = "AllPrincipals"
+                resourceId  = $bpSPId
+                scope       = "access_as_user"
+            }
+            Invoke-MgGraphRequest -Method POST `
+                -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants" `
+                -Body ($consentBody | ConvertTo-Json) | Out-Null
+            Write-Host "  [OK] Admin consent granted for access_as_user" -ForegroundColor Green
+        }
+        catch {
+            if ($_.Exception.Message -like "*already exists*") {
+                Write-Host "  [OK] Admin consent already granted" -ForegroundColor Green
+            } else {
+                Write-Warning "  Admin consent failed: $($_.Exception.Message)"
+                Write-Host "  You may need to grant consent manually in the Azure Portal." -ForegroundColor Yellow
+                Write-Host "  Azure Portal > App registrations > $DisplayName > API permissions > Grant admin consent" -ForegroundColor Yellow
+            }
+        }
+    }
+
+    # ---------------------------------------------------------------
+    # Summary
+    # ---------------------------------------------------------------
+    Write-Host ""
+    Write-Host "  ============================================================" -ForegroundColor Green
+    Write-Host "  [OK] SPA App Registration Complete!" -ForegroundColor Green
+    Write-Host "  ============================================================" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  SPA App ID (CLIENT_SPA_APP_ID): $spaAppId" -ForegroundColor White
+    Write-Host "  Blueprint App ID:               $BlueprintAppId" -ForegroundColor Gray
+    Write-Host "  Exposed Scope:                  api://$BlueprintAppId/access_as_user" -ForegroundColor Gray
+    Write-Host "  Redirect URIs:                  $($RedirectUris -join ', ')" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  Add to your .env or docker-compose environment:" -ForegroundColor Yellow
+    Write-Host "    CLIENT_SPA_APP_ID=$spaAppId" -ForegroundColor White
+    Write-Host ""
+
+    return @{
+        SpaAppId       = $spaAppId
+        SpaObjectId    = $spaObjectId
+        SpaPrincipalId = $spaSP.id
+        BlueprintAppId = $BlueprintAppId
+        ScopeId        = $scopeId
+        RedirectUris   = $RedirectUris
+    }
+}
+
+function Remove-AgentIdentitySpaApp {
+    <#
+    .SYNOPSIS
+    Deletes a SPA app registration by its App ID and optionally removes the
+    'access_as_user' scope from the Blueprint.
+
+    .PARAMETER SpaAppId
+    The App ID (client ID) of the SPA to delete.
+
+    .PARAMETER BlueprintAppId
+    If provided, also removes the SPA from preAuthorizedApplications on the Blueprint.
+
+    .PARAMETER Force
+    If specified, skips the confirmation prompt.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SpaAppId,
+
+        [Parameter(Mandatory = $false)]
+        [string]$BlueprintAppId,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Force
+    )
+
+    Write-Host "[SPA] Deleting SPA App Registration..." -ForegroundColor Cyan
+
+    # Find the application object
+    $apps = (Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$SpaAppId'").value
+
+    if (-not $apps -or $apps.Count -eq 0) {
+        Write-Host "  SPA application not found with appId: $SpaAppId" -ForegroundColor Yellow
+        return
+    }
+    $app = $apps[0]
+
+    if (-not $Force) {
+        Write-Host "  App: $($app.displayName) ($SpaAppId)" -ForegroundColor White
+        $confirm = Read-Host "  Delete this SPA app registration? (y/N)"
+        if ($confirm -notin @('y', 'Y', 'yes', 'Yes', 'YES')) {
+            Write-Host "  Cancelled." -ForegroundColor Yellow
+            return
+        }
+    }
+
+    # Remove from Blueprint preAuthorizedApplications if BlueprintAppId provided
+    if ($BlueprintAppId) {
+        try {
+            $bpApps = (Invoke-MgGraphRequest -Method GET `
+                -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$BlueprintAppId'").value
+            if ($bpApps -and $bpApps.Count -gt 0) {
+                $bpApp = $bpApps[0]
+                $existing = $bpApp.api.preAuthorizedApplications
+                $filtered = $existing | Where-Object { $_.appId -ne $SpaAppId }
+                $patchBody = @{
+                    api = @{
+                        preAuthorizedApplications = @($filtered)
+                    }
+                }
+                Invoke-MgGraphRequest -Method PATCH `
+                    -Uri "https://graph.microsoft.com/v1.0/applications/$($bpApp.id)" `
+                    -Body ($patchBody | ConvertTo-Json -Depth 5) | Out-Null
+                Write-Host "  [OK] Removed SPA from Blueprint preAuthorizedApplications" -ForegroundColor Green
+            }
+        }
+        catch {
+            Write-Warning "  Could not update Blueprint: $($_.Exception.Message)"
+        }
+    }
+
+    # Delete the SPA application
+    try {
+        Invoke-MgGraphRequest -Method DELETE `
+            -Uri "https://graph.microsoft.com/v1.0/applications/$($app.id)"
+        Write-Host "  [OK] Deleted SPA app: $($app.displayName) ($SpaAppId)" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "  [ERROR] Failed to delete SPA app: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+#endregion
+
 #region Step 6: Test Agent Token
 
 function Test-AgentIdentityToken {
@@ -908,7 +1329,7 @@ function Test-AgentIdentityToken {
     Maximum number of retry attempts. Default: 10
     
     .PARAMETER RetryDelaySeconds
-    Seconds to wait between retries. Default: 10
+    Seconds to wait between retries. Default: 15
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -918,7 +1339,7 @@ function Test-AgentIdentityToken {
         [int]$MaxRetries = 10,
         
         [Parameter(Mandatory = $false)]
-        [int]$RetryDelaySeconds = 10
+        [int]$RetryDelaySeconds = 15
     )
     
     Write-Host "[TEST] Step 6: Testing Agent Identity Token..." -ForegroundColor Cyan
@@ -1101,7 +1522,8 @@ function Start-EntraAgentIDWorkflow {
             -ClientSecret $blueprint.ClientSecret `
             -TenantId $connection.TenantId `
             -UserId $blueprint.UserId
-        Start-Sleep -Seconds 3
+        Write-Host "  [WAIT] Waiting for agent identity to propagate..." -ForegroundColor Gray
+        Start-Sleep -Seconds 15
         
         # Step 4: Get Initial Token (before permissions)
         Write-Host "`n[INFO] Getting initial token (before permissions)..." -ForegroundColor Cyan
@@ -1238,6 +1660,286 @@ function Get-BlueprintList {
 
 #endregion
 
+#region Deletion Functions
+
+function Remove-AllAgentIdentities {
+    <#
+    .SYNOPSIS
+    Deletes all Agent Identities in the tenant.
+    
+    .PARAMETER Force
+    If specified, skips the confirmation prompt.
+    
+    .EXAMPLE
+    Remove-AllAgentIdentities
+    
+    .EXAMPLE
+    Remove-AllAgentIdentities -Force
+    #>
+    param(
+        [Parameter(Mandatory = $false)]
+        [switch]$Force
+    )
+    
+    Write-Host "[AGENT] Listing all Agent Identities..." -ForegroundColor Cyan
+    
+    try {
+        $agentIdentities = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/beta/servicePrincipals/graph.agentIdentity"
+    }
+    catch {
+        Write-Host "  [ERROR] Failed to list agent identities: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+    
+    $agents = $agentIdentities.value
+    if (-not $agents -or $agents.Count -eq 0) {
+        Write-Host "  No agent identities found." -ForegroundColor Yellow
+        return
+    }
+    
+    Write-Host "  Found $($agents.Count) agent identit(ies):" -ForegroundColor White
+    $agents | ForEach-Object {
+        Write-Host "    - $($_.displayName)  (appId: $($_.appId), id: $($_.id))" -ForegroundColor Gray
+    }
+    Write-Host ""
+    
+    if (-not $Force) {
+        $confirm = Read-Host "  Are you sure you want to DELETE all $($agents.Count) agent identit(ies)? (y/N)"
+        if ($confirm -notin @('y', 'Y', 'yes', 'Yes', 'YES')) {
+            Write-Host "  Cancelled." -ForegroundColor Yellow
+            return
+        }
+    }
+    
+    $deleted = 0
+    $failed = 0
+    foreach ($agent in $agents) {
+        try {
+            Invoke-MgGraphRequest -Method DELETE `
+                -Uri "https://graph.microsoft.com/beta/servicePrincipals/$($agent.id)"
+            Write-Host "  [OK] Deleted agent identity: $($agent.displayName) ($($agent.appId))" -ForegroundColor Green
+            $deleted++
+        }
+        catch {
+            Write-Host "  [ERROR] Failed to delete $($agent.displayName): $($_.Exception.Message)" -ForegroundColor Red
+            $failed++
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "  Deleted: $deleted  Failed: $failed" -ForegroundColor $(if ($failed -gt 0) { "Yellow" } else { "Green" })
+}
+
+function Remove-AllBlueprints {
+    <#
+    .SYNOPSIS
+    Deletes all Agent Identity Blueprints in the tenant.
+    
+    .DESCRIPTION
+    Deletes blueprints (application registrations of type AgentIdentityBlueprint).
+    You should delete Agent Identities BEFORE deleting their parent Blueprints.
+    
+    .PARAMETER Force
+    If specified, skips the confirmation prompt.
+    
+    .EXAMPLE
+    Remove-AllBlueprints
+    
+    .EXAMPLE
+    Remove-AllBlueprints -Force
+    #>
+    param(
+        [Parameter(Mandatory = $false)]
+        [switch]$Force
+    )
+    
+    Write-Host "[INFO] Listing all Blueprints..." -ForegroundColor Cyan
+    
+    try {
+        $blueprints = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/beta/applications/graph.agentIdentityBlueprint"
+    }
+    catch {
+        Write-Host "  [ERROR] Failed to list blueprints: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+    
+    $bps = $blueprints.value
+    if (-not $bps -or $bps.Count -eq 0) {
+        Write-Host "  No blueprints found." -ForegroundColor Yellow
+        return
+    }
+    
+    Write-Host "  Found $($bps.Count) blueprint(s):" -ForegroundColor White
+    $bps | ForEach-Object {
+        Write-Host "    - $($_.displayName)  (appId: $($_.appId), id: $($_.id))" -ForegroundColor Gray
+    }
+    Write-Host ""
+    
+    if (-not $Force) {
+        $confirm = Read-Host "  Are you sure you want to DELETE all $($bps.Count) blueprint(s)? (y/N)"
+        if ($confirm -notin @('y', 'Y', 'yes', 'Yes', 'YES')) {
+            Write-Host "  Cancelled." -ForegroundColor Yellow
+            return
+        }
+    }
+    
+    $deleted = 0
+    $failed = 0
+    foreach ($bp in $bps) {
+        try {
+            Invoke-MgGraphRequest -Method DELETE `
+                -Uri "https://graph.microsoft.com/beta/applications/$($bp.id)"
+            Write-Host "  [OK] Deleted blueprint: $($bp.displayName) ($($bp.appId))" -ForegroundColor Green
+            $deleted++
+        }
+        catch {
+            Write-Host "  [ERROR] Failed to delete $($bp.displayName): $($_.Exception.Message)" -ForegroundColor Red
+            $failed++
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "  Deleted: $deleted  Failed: $failed" -ForegroundColor $(if ($failed -gt 0) { "Yellow" } else { "Green" })
+}
+
+function Remove-AllAgentUsers {
+    <#
+    .SYNOPSIS
+    Deletes all Agent Users in the tenant.
+    
+    .PARAMETER Force
+    If specified, skips the confirmation prompt.
+    
+    .EXAMPLE
+    Remove-AllAgentUsers
+    
+    .EXAMPLE
+    Remove-AllAgentUsers -Force
+    #>
+    param(
+        [Parameter(Mandatory = $false)]
+        [switch]$Force
+    )
+    
+    Write-Host "[USER] Listing all Agent Users..." -ForegroundColor Cyan
+    
+    try {
+        $agentUsers = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/beta/users?`$filter=userType eq 'AgentUser'"
+    }
+    catch {
+        Write-Host "  [ERROR] Failed to list agent users: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+    
+    $users = $agentUsers.value
+    if (-not $users -or $users.Count -eq 0) {
+        Write-Host "  No agent users found." -ForegroundColor Yellow
+        return
+    }
+    
+    Write-Host "  Found $($users.Count) agent user(s):" -ForegroundColor White
+    $users | ForEach-Object {
+        Write-Host "    - $($_.displayName)  (upn: $($_.userPrincipalName), id: $($_.id))" -ForegroundColor Gray
+    }
+    Write-Host ""
+    
+    if (-not $Force) {
+        $confirm = Read-Host "  Are you sure you want to DELETE all $($users.Count) agent user(s)? (y/N)"
+        if ($confirm -notin @('y', 'Y', 'yes', 'Yes', 'YES')) {
+            Write-Host "  Cancelled." -ForegroundColor Yellow
+            return
+        }
+    }
+    
+    $deleted = 0
+    $failed = 0
+    foreach ($user in $users) {
+        try {
+            Invoke-MgGraphRequest -Method DELETE `
+                -Uri "https://graph.microsoft.com/beta/users/$($user.id)"
+            Write-Host "  [OK] Deleted agent user: $($user.displayName) ($($user.userPrincipalName))" -ForegroundColor Green
+            $deleted++
+        }
+        catch {
+            Write-Host "  [ERROR] Failed to delete $($user.displayName): $($_.Exception.Message)" -ForegroundColor Red
+            $failed++
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "  Deleted: $deleted  Failed: $failed" -ForegroundColor $(if ($failed -gt 0) { "Yellow" } else { "Green" })
+}
+
+function Remove-AllEntraAgentIDResources {
+    <#
+    .SYNOPSIS
+    Deletes ALL Agent Identity resources: Agent Users, Agent Identities, and Blueprints.
+    
+    .DESCRIPTION
+    Performs a complete cleanup in the correct order:
+      1. Agent Users (must be deleted before their parent agent identities)
+      2. Agent Identities (must be deleted before their parent blueprints)
+      3. Blueprints
+    
+    NOTE: Do NOT have Directory.ReadWrite.All in your scopes — it BLOCKS Agent deletion
+    (Microsoft Known Issue). Use the scopes from Connect-EntraAgentIDEnvironment.
+    
+    .PARAMETER Force
+    If specified, skips all confirmation prompts.
+    
+    .EXAMPLE
+    Remove-AllEntraAgentIDResources
+    
+    .EXAMPLE
+    Remove-AllEntraAgentIDResources -Force
+    #>
+    param(
+        [Parameter(Mandatory = $false)]
+        [switch]$Force
+    )
+    
+    Write-Host "`n============================================================" -ForegroundColor Red
+    Write-Host "   Delete ALL Entra Agent ID Resources" -ForegroundColor Red
+    Write-Host "============================================================`n" -ForegroundColor Red
+    
+    Write-Host "[WARN] This will delete ALL agent users, agent identities, and blueprints in the tenant." -ForegroundColor Yellow
+    Write-Host ""
+    
+    if (-not $Force) {
+        $confirm = Read-Host "  Proceed with full cleanup? (y/N)"
+        if ($confirm -notin @('y', 'Y', 'yes', 'Yes', 'YES')) {
+            Write-Host "  Cancelled." -ForegroundColor Yellow
+            return
+        }
+    }
+    
+    Write-Host ""
+    
+    # Step 1: Delete Agent Users first
+    Write-Host "--- Step 1/3: Agent Users ---" -ForegroundColor Cyan
+    Remove-AllAgentUsers -Force
+    Write-Host ""
+    
+    # Step 2: Delete Agent Identities (before their parent blueprints)
+    Write-Host "--- Step 2/3: Agent Identities ---" -ForegroundColor Cyan
+    Remove-AllAgentIdentities -Force
+    Write-Host ""
+    
+    # Step 3: Delete Blueprints last
+    Write-Host "--- Step 3/3: Blueprints ---" -ForegroundColor Cyan
+    Remove-AllBlueprints -Force
+    Write-Host ""
+    
+    Write-Host "============================================================" -ForegroundColor Green
+    Write-Host "   Cleanup Complete" -ForegroundColor Green
+    Write-Host "============================================================`n" -ForegroundColor Green
+}
+
+#endregion
+
 # Script loaded message
 Write-Host "`n[OK] Entra Agent ID Functions loaded!" -ForegroundColor Green
 Write-Host ""
@@ -1254,4 +1956,14 @@ Write-Host "  New-AgentIdentityBlueprint -BlueprintName '<name>' -TenantId '<ten
 Write-Host "  New-AgentUser -AgentIdentityId '<agent-app-id>' -DisplayName 'Agent User Name'" -ForegroundColor Gray
 Write-Host "  Get-AgentUsersList" -ForegroundColor Gray
 Write-Host "  Get-AgentIdentityList" -ForegroundColor Gray
-Write-Host "  Get-BlueprintList`n" -ForegroundColor Gray
+Write-Host "  Get-BlueprintList" -ForegroundColor Gray
+Write-Host ""
+Write-Host "OBO / SPA Functions:" -ForegroundColor Cyan
+Write-Host "  New-AgentIdentitySpaApp -DisplayName 'My SPA' -BlueprintAppId '<id>' -TenantId '<id>'" -ForegroundColor Gray
+Write-Host "  Remove-AgentIdentitySpaApp -SpaAppId '<id>' -BlueprintAppId '<id>'" -ForegroundColor Gray
+Write-Host ""
+Write-Host "Cleanup Functions:" -ForegroundColor Cyan
+Write-Host "  Remove-AllEntraAgentIDResources          # Delete everything (users, agents, blueprints)" -ForegroundColor Gray
+Write-Host "  Remove-AllAgentUsers                     # Delete all agent users" -ForegroundColor Gray
+Write-Host "  Remove-AllAgentIdentities                # Delete all agent identities" -ForegroundColor Gray
+Write-Host "  Remove-AllBlueprints                     # Delete all blueprints`n" -ForegroundColor Gray

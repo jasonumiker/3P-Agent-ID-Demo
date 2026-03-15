@@ -4,6 +4,7 @@ services:
   # Microsoft Entra SDK for AgentID Sidecar
   sidecar:
     image: mcr.microsoft.com/entra-sdk/auth-sidecar:1.0.0-azurelinux3.0-distroless
+    platform: linux/amd64
     container_name: agent-id-sidecar-aws
     ports:
       - "5001:5000"
@@ -53,6 +54,9 @@ services:
       - SIDECAR_URL=http://sidecar:5000
       - WEATHER_API_URL=http://weather-api:8080
       - AGENT_APP_ID=${AGENT_CLIENT_ID}
+      - TENANT_ID=${TENANT_ID}
+      - BLUEPRINT_APP_ID=${BLUEPRINT_APP_ID}
+      - CLIENT_SPA_APP_ID=${CLIENT_SPA_APP_ID}
       - AWS_REGION=${AWS_REGION:-us-east-1}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
